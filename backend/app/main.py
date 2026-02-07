@@ -20,6 +20,8 @@ from pydantic import BaseModel
 from .audio import AdaptiveDenoiser, AudioPipeline, PipelineConfig
 from .core import AudioChunk
 from .services.conversation_stream import ConversationEventBus
+from .video.pipeline import VideoPipeline, get_video_pipeline
+from .services.convex_client import get_convex_service
 
 logger = logging.getLogger("webrtc")
 if not logger.handlers:
@@ -59,6 +61,14 @@ audio_pipeline = AudioPipeline(
     conversation_bus=conversation_bus,
 )
 
+# Video pipeline for face recognition
+convex_service = get_convex_service()
+video_pipeline = get_video_pipeline(convex_service=convex_service)
+
+# Session state for audio-video fusion
+# Maps session_id -> {"speaker_id": str, "has_face": bool, "pending_face": List[float]}
+session_states: dict[str, dict] = {}
+
 class SDPModel(BaseModel):
     sdp: str
     type: str
@@ -66,10 +76,13 @@ class SDPModel(BaseModel):
 
 @app.on_event("startup")
 async def on_startup() -> None:
-    try:
-        await audio_pipeline.warm_whisper()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Whisper warm-up failed: %s", exc)
+    # Don't block startup - whisper will load on first use
+    async def _warmup():
+        try:
+            await audio_pipeline.warm_whisper()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Whisper warm-up failed: %s", exc)
+    asyncio.create_task(_warmup())
 
 
 @app.get("/")
@@ -139,11 +152,56 @@ async def offer(session: SDPModel) -> SDPModel:
             asyncio.create_task(consume_audio())
 
         else:
-
+            # Video track - process for face recognition
             async def consume_video() -> None:
+                import time
+                frame_count = 0
+                last_face_id = None
+                
                 while True:
                     try:
-                        await track.recv()
+                        frame = await track.recv()
+                        frame_count += 1
+                        
+                        # Only process every 30 frames (~1 FPS at 30fps input)
+                        if frame_count % 30 != 0:
+                            continue
+                        
+                        if not video_pipeline.is_available:
+                            continue
+                        
+                        # Convert aiortc frame to numpy array
+                        try:
+                            import numpy as np
+                            # Get frame as numpy array (BGR format)
+                            img = frame.to_ndarray(format="bgr24")
+                            timestamp = time.time()
+                            
+                            # Process frame for faces
+                            detections = await video_pipeline.process_frame(img, timestamp)
+                            
+                            if detections:
+                                # Try to match face to known speaker
+                                face = detections[0]  # Use first/largest face
+                                result = await video_pipeline.match_face_to_speaker(face.embedding)
+                                
+                                if result and result.get("found"):
+                                    speaker_id = result.get("speakerId")
+                                    if speaker_id != last_face_id:
+                                        logger.info(
+                                            "Face recognized: %s (score=%.2f)",
+                                            result.get("speaker", {}).get("name", "Unknown"),
+                                            result.get("score", 0)
+                                        )
+                                        last_face_id = speaker_id
+                                else:
+                                    # Unknown face - could be associated with current audio speaker
+                                    logger.debug("Unknown face detected")
+                                    last_face_id = None
+                        except Exception as exc:
+                            logger.debug("Video frame processing error: %s", exc)
+                            continue
+                            
                     except Exception:  # noqa: BLE001
                         break
 
@@ -200,3 +258,32 @@ async def stream_conversation() -> StreamingResponse:
 
     headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+
+
+@app.get("/stream/inference")
+async def stream_inference() -> StreamingResponse:
+    """SSE endpoint for streaming inference events to the frontend."""
+
+    async def event_generator():
+        queue = await conversation_bus.subscribe()
+        try:
+            while True:
+                try:
+                    event = await queue.get()
+                except asyncio.CancelledError:
+                    break
+                # Transform to match frontend expected format
+                payload = {
+                    "name": event.person_id or "Unknown",
+                    "description": " ".join(u.text for u in event.conversation) if event.conversation else "",
+                    "relationship": "Speaker",
+                    "person_id": event.person_id,
+                }
+                import json
+                yield f"event: inference\ndata: {json.dumps(payload)}\n\n"
+        finally:
+            await conversation_bus.unsubscribe(queue)
+
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(event_generator(), media_type="text/event-stream", headers=headers)
+

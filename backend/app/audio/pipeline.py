@@ -17,9 +17,32 @@ from ..services.conversation_stream import ConversationEventBus
 from .denoiser import AdaptiveDenoiser
 
 try:  # pragma: no cover - optional dependency
-    import whisper
+    from faster_whisper import WhisperModel
+    faster_whisper_available = True
 except ImportError:  # pragma: no cover
-    whisper = None
+    WhisperModel = None
+    faster_whisper_available = False
+
+try:  # pragma: no cover - optional dependency
+    from groq import Groq
+    groq_available = True
+except ImportError:  # pragma: no cover
+    Groq = None
+    groq_available = False
+
+try:  # pragma: no cover - optional dependency
+    from elevenlabs.client import ElevenLabs
+    elevenlabs_available = True
+except ImportError:  # pragma: no cover
+    ElevenLabs = None
+    elevenlabs_available = False
+
+try:  # pragma: no cover - Sarvam AI for Indian English
+    from sarvamai import SarvamAI
+    sarvam_available = True
+except ImportError:  # pragma: no cover
+    SarvamAI = None
+    sarvam_available = False
 
 try:  # pragma: no cover - optional dependency
     from torchaudio.functional import resample as ta_resample
@@ -39,15 +62,21 @@ except ImportError:  # pragma: no cover
 
 logger = logging.getLogger("webrtc.audio.pipeline")
 
+# Indian English optimization prompt - hyper-focused on user's name
+# Repetition helps Whisper learn the correct spelling
+INDIAN_ENGLISH_PROMPT = """My name is Mayank. I'm Mayank. Hi, I'm Mayank Joshi. 
+Mayank speaking here. This is Mayank. Hello, my name is Mayank.
+Other names: Priya, Rahul, Aarav, Ananya, Vikram, Neha, Arjun."""
+
 
 @dataclass
 class PipelineConfig:
     target_sample_rate: int = 16_000
-    silence_timeout_seconds: float = 2.0
-    min_conversation_seconds: float = 2.0
-    vad_aggressiveness: int = 3
-    transcription_model: str = "large-v3"
-    min_speech_rms: float = 0.01
+    silence_timeout_seconds: float = 1.5  # Reduced from 2.0 for faster response
+    min_conversation_seconds: float = 2.0  # Reduced from 2.0
+    vad_aggressiveness: int = 1
+    transcription_model: str = "large-v3"  # Best accuracy with faster-whisper
+    min_speech_rms: float = 0.005
     noise_floor_smoothing: float = 0.9
     noise_gate_margin: float = 0.005
     embedding_model: str = "pyannote/embedding"
@@ -103,10 +132,16 @@ class AudioPipeline:
         self._vad = webrtcvad.Vad(self.config.vad_aggressiveness) if webrtcvad else None
         self._pyannote_inference = None
         self._speaker_profiles: List[SpeakerProfile] = []
+        self._speaker_names: Dict[str, str] = {}  # speaker_id -> real name
+        self._speaker_convex_ids: Dict[str, str] = {}  # local speaker_id -> Convex ID
         self._speaker_lock = asyncio.Lock()
         self._next_speaker_index = 10
         self._pyannote_auth_token = os.getenv("PYANNOTE_AUTH_TOKEN")
         self._conversation_bus = conversation_bus
+        
+        # Initialize Convex memory service
+        from ..services.convex_client import get_convex_service
+        self._convex = get_convex_service()
 
         if PyannoteInference is None:
             logger.warning(
@@ -215,8 +250,8 @@ class AudioPipeline:
             await self._finalize_conversation(session_id, "session flush")
 
     async def warm_whisper(self) -> None:
-        if whisper is None:
-            logger.info("Whisper not installed; skipping warm-up")
+        if not faster_whisper_available:
+            logger.info("faster-whisper not installed; skipping warm-up")
             return
         await self._load_whisper_model()
 
@@ -266,9 +301,21 @@ class AudioPipeline:
 
         transcript = await self._transcribe_audio(audio)
         await self._assign_speakers(state, session_id, audio, transcript)
-        await self._publish_conversation_event(state, session_id, transcript)
+        
+        # Extract names from transcripts ("I'm John", "My name is Sarah", etc.)
+        for seg in transcript:
+            if seg.speaker and seg.text:
+                await self._extract_and_assign_name(seg.text, seg.speaker)
+        
         if transcript:
+            # Save conversation to Convex for each speaker (Generates/Gets Convex IDs)
+            await self._save_conversation_to_convex(transcript, duration)
+            
+            # Print transcript
             self._print_transcript(state.conversation_id, transcript)
+            
+            # Publish event (Now has access to Convex IDs)
+            await self._publish_conversation_event(state, session_id, transcript)
         else:
             logger.info(
                 "Conversation %s for session=%s produced no transcription",
@@ -279,13 +326,145 @@ class AudioPipeline:
             "Ending conversation %s for session=%s (reason=%s, duration=%.2fs)",
             state.conversation_id,
             session_id,
-            reason,
+        reason,
             duration,
         )
 
     async def _transcribe_audio(self, audio: np.ndarray) -> List[TranscriptSegment]:
-        if whisper is None:
-            logger.warning("Whisper not installed; skipping transcription")
+        # Try Sarvam AI first (Best for Indian English)
+        if sarvam_available and os.environ.get("SARVAM_API_KEY"):
+            sarvam_result = await self._transcribe_with_sarvam(audio)
+            if sarvam_result:
+                return sarvam_result
+        
+        # Try Groq cloud API second (with Indian English prompting)
+        if groq_available and os.environ.get("GROQ_API_KEY"):
+            groq_result = await self._transcribe_with_groq(audio)
+            if groq_result:
+                return groq_result
+        
+        # Try ElevenLabs Scribe v2 third
+        if elevenlabs_available and os.environ.get("ELEVENLABS_API_KEY"):
+            scribe_result = await self._transcribe_with_elevenlabs(audio)
+            if scribe_result:
+                return scribe_result
+
+        # Fallback to local faster-whisper
+        return await self._transcribe_with_local_whisper(audio)
+    
+    async def _transcribe_with_sarvam(self, audio: np.ndarray) -> List[TranscriptSegment]:
+        """Transcribe audio using Sarvam AI (optimized for Indian English)."""
+        import tempfile
+        import wave
+        
+        api_key = os.environ.get("SARVAM_API_KEY")
+        if not api_key:
+            return []
+        
+        try:
+            # Convert float32 audio to int16 WAV
+            audio_int16 = (audio * 32767).astype(np.int16)
+            
+            # Save to temp WAV file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_path = f.name
+                with wave.open(f, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(self.config.target_sample_rate)
+                    wav.writeframes(audio_int16.tobytes())
+            
+            # Call Sarvam API
+            def _call_sarvam():
+                client = SarvamAI(api_subscription_key=api_key)
+                with open(temp_path, "rb") as audio_file:
+                    response = client.speech_to_text.transcribe(
+                        file=audio_file,
+                        language_code="en-IN",  # Indian English
+                        model="saarika:v2.5"
+                    )
+                return response
+            
+            result = await asyncio.to_thread(_call_sarvam)
+            
+            # Clean up temp file
+            os.unlink(temp_path)
+            
+            # Parse response
+            if result and hasattr(result, 'transcript') and result.transcript:
+                logger.info("Sarvam transcription: %s", result.transcript)
+                return [TranscriptSegment(
+                    start=0.0,
+                    end=len(audio) / self.config.target_sample_rate,
+                    text=result.transcript.strip(),
+                )]
+            
+            return []
+            
+        except Exception as exc:
+            logger.warning("Sarvam transcription failed: %s", exc)
+            return []
+
+    async def _transcribe_with_elevenlabs(self, audio: np.ndarray) -> List[TranscriptSegment]:
+        """Transcribe audio using ElevenLabs Scribe v2."""
+        import tempfile
+        import wave
+        
+        api_key = os.environ.get("ELEVENLABS_API_KEY")
+        if not api_key:
+            return []
+            
+        try:
+            # Normalize audio
+            audio_rms = np.sqrt(np.mean(audio ** 2))
+            if audio_rms > 0.001:
+                target_rms = 0.1
+                gain = min(target_rms / audio_rms, 10.0)
+                audio = np.clip(audio * gain, -1.0, 1.0)
+            
+            # Convert to WAV
+            audio_int16 = (audio * 32767).astype(np.int16)
+            
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_path = f.name
+                with wave.open(f, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(self.config.target_sample_rate)
+                    wav.writeframes(audio_int16.tobytes())
+            
+            # Call ElevenLabs API
+            def _call_scribe():
+                client = ElevenLabs(api_key=api_key)
+                with open(temp_path, "rb") as audio_file:
+                    return client.speech_to_text.convert(
+                        file=audio_file,
+                        model_id="scribe_v2"
+                    )
+            
+            result = await asyncio.to_thread(_call_scribe)
+            os.unlink(temp_path)
+            
+            if result and hasattr(result, "text"):
+                logger.info("ElevenLabs transcription: %s", result.text)
+                # Create a single segment for now as Scribe v2 returns full text
+                return [TranscriptSegment(
+                    start=0.0,
+                    end=len(audio) / self.config.target_sample_rate,
+                    text=result.text.strip()
+                )]
+            return []
+            
+        except Exception as exc:
+            logger.warning("ElevenLabs transcription failed: %s", exc)
+            if 'temp_path' in locals() and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return []
+
+    async def _transcribe_with_local_whisper(self, audio: np.ndarray) -> List[TranscriptSegment]:
+        """Fallback transcription using local faster-whisper."""
+        if not faster_whisper_available:
+            logger.warning("No transcription backend available")
             return []
 
         model = await self._load_whisper_model()
@@ -293,36 +472,227 @@ class AudioPipeline:
             return []
 
         try:
-            result = await asyncio.to_thread(
-                model.transcribe,
-                audio,
-                fp16=False,
-            )
+            def _transcribe():
+                segments, info = model.transcribe(
+                    audio,
+                    language="en",
+                    task="transcribe",
+                    beam_size=5,
+                    best_of=5,
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    condition_on_previous_text=False,
+                    initial_prompt=INDIAN_ENGLISH_PROMPT,  # Indian accent optimization
+                )
+                return list(segments), info
+            
+            segments, info = await asyncio.to_thread(_transcribe)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Whisper transcription failed: %s", exc)
+            logger.warning("Local Whisper transcription failed: %s", exc)
             return []
 
-        segments = result.get("segments") or []
         snippets: List[TranscriptSegment] = []
         for seg in segments:
-            start = float(seg.get("start", 0.0))
-            end = float(seg.get("end", start))
-            if end <= start:
-                duration = float(seg.get("duration", 0.0))
-                end = start + max(duration, 0.0)
-            text = (seg.get("text") or "").strip()
+            text = seg.text.strip() if seg.text else ""
             if text:
-                snippets.append(TranscriptSegment(start=start, end=end, text=text))
-        if not snippets and result.get("text"):
-            total_duration = audio.size / float(self.config.target_sample_rate)
-            snippets.append(
-                TranscriptSegment(
-                    start=0.0,
-                    end=total_duration,
-                    text=result["text"].strip(),
-                )
-            )
+                snippets.append(TranscriptSegment(
+                    start=seg.start,
+                    end=seg.end,
+                    text=text,
+                ))
+        
         return snippets
+
+    async def _transcribe_with_groq(self, audio: np.ndarray) -> List[TranscriptSegment]:
+        """Transcribe audio using Groq's cloud Whisper API."""
+        import tempfile
+        import wave
+        import os
+        
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            logger.debug("GROQ_API_KEY not set; skipping Groq transcription")
+            return []
+        
+        try:
+            # Skip robust normalization to match "Playground" raw quality
+            # Whisper is good at handling dynamic range. Normalization often amplifies noise.
+            audio_normalized = audio
+            
+            # Convert float32 audio to int16 WAV
+            audio_int16 = (audio_normalized * 32767).astype(np.int16)
+            
+            # Log audio duration for debugging
+            duration_sec = len(audio) / self.config.target_sample_rate
+            logger.debug("Sending %.2fs audio to Groq (samples=%d)", duration_sec, len(audio))
+            
+            # Save to temp WAV file
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                temp_path = f.name
+                with wave.open(f, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)  # 16-bit
+                    wav.setframerate(self.config.target_sample_rate)
+                    wav.writeframes(audio_int16.tobytes())
+            
+            # Call Groq API
+            def _call_groq():
+                client = Groq(api_key=api_key)
+                with open(temp_path, "rb") as audio_file:
+                    transcription = client.audio.transcriptions.create(
+                        file=(temp_path, audio_file.read()),
+                        model="whisper-large-v3-turbo",
+                        temperature=0.0,  # Deterministic output
+                        prompt=INDIAN_ENGLISH_PROMPT,
+                        language="en",
+                        response_format="verbose_json",
+                    )
+                return transcription
+            
+            result = await asyncio.to_thread(_call_groq)
+            
+            # Clean up temp file
+            os.unlink(temp_path)
+            
+            # Parse segments
+            snippets: List[TranscriptSegment] = []
+            if hasattr(result, "segments") and result.segments:
+                for seg in result.segments:
+                    text = seg.get("text", "").strip() if isinstance(seg, dict) else getattr(seg, "text", "").strip()
+                    start = seg.get("start", 0.0) if isinstance(seg, dict) else getattr(seg, "start", 0.0)
+                    end = seg.get("end", 0.0) if isinstance(seg, dict) else getattr(seg, "end", 0.0)
+                    if text:
+                        snippets.append(TranscriptSegment(start=start, end=end, text=text))
+            elif hasattr(result, "text") and result.text:
+                # Fallback: single segment
+                snippets.append(TranscriptSegment(
+                    start=0.0,
+                    end=len(audio) / self.config.target_sample_rate,
+                    text=result.text.strip(),
+                ))
+            
+            if snippets:
+                logger.info("Groq transcription successful: %s", snippets[0].text[:50] + "..." if len(snippets[0].text) > 50 else snippets[0].text)
+            return snippets
+            
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Groq transcription failed: %s", exc)
+            return []
+
+    async def _extract_and_assign_name(self, text: str, speaker_id: str) -> Optional[str]:
+        """Use Groq LLM to extract a name from phrases like 'I'm John' or 'My name is Sarah'."""
+        import os
+        
+        # Skip if speaker already has a name
+        if speaker_id in self._speaker_names:
+            return self._speaker_names[speaker_id]
+        
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key or not groq_available:
+            return None
+        
+        # Simple pattern matching first (fast path)
+        import re
+        simple_patterns = [
+            r"(?:I'm|I am|my name is|call me|this is)\s+([A-Z][a-z]+)",
+            r"^([A-Z][a-z]+)\s+(?:here|speaking)",
+        ]
+        for pattern in simple_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                name = match.group(1).title()
+                self._speaker_names[speaker_id] = name
+                logger.info("Extracted name '%s' for %s using pattern matching", name, speaker_id)
+                return name
+        
+        # Use Groq LLM for more complex cases
+        try:
+            def _call_groq():
+                client = Groq(api_key=api_key)
+                response = client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Extract the speaker's name from the text if they introduce themselves. Reply with ONLY the name (e.g., 'John') or 'NONE' if no name is found. Do not include any other text."
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Text: \"{text}\""
+                        }
+                    ],
+                    temperature=0,
+                    max_tokens=20,
+                )
+                return response.choices[0].message.content.strip()
+            
+            result = await asyncio.to_thread(_call_groq)
+            
+            if result and result.upper() != "NONE" and len(result) < 30:
+                name = result.title()
+                self._speaker_names[speaker_id] = name
+                logger.info("Extracted name '%s' for %s using LLM", name, speaker_id)
+                return name
+                
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Name extraction failed: %s", exc)
+        
+        return None
+
+    async def _save_conversation_to_convex(
+        self, 
+        transcript: List[TranscriptSegment], 
+        duration: float
+    ) -> None:
+        """Save conversation transcript to Convex, grouped by speaker."""
+        if not self._convex.is_available:
+            return
+        
+        # Group transcript segments by speaker
+        speaker_texts: Dict[str, List[str]] = {}
+        for seg in transcript:
+            if seg.speaker and seg.text:
+                if seg.speaker not in speaker_texts:
+                    speaker_texts[seg.speaker] = []
+                speaker_texts[seg.speaker].append(seg.text)
+        
+        # Save each speaker's contribution
+        for speaker_id, texts in speaker_texts.items():
+            convex_id = self._speaker_convex_ids.get(speaker_id)
+            if not convex_id:
+                # Need to find/create speaker in Convex using their embedding
+                profile = next(
+                    (p for p in self._speaker_profiles if p.speaker_id == speaker_id), 
+                    None
+                )
+                if profile:
+                    result = await self._convex.find_or_create_speaker(
+                        embedding=profile.embedding.tolist(),
+                        name=self._speaker_names.get(speaker_id),
+                        speaking_time=duration,
+                    )
+                    convex_id = result.get("speakerId")
+                    if convex_id:
+                        self._speaker_convex_ids[speaker_id] = convex_id
+            
+            if convex_id:
+                combined_text = " ".join(texts)
+                await self._convex.save_conversation(
+                    speaker_id=convex_id,
+                    transcript=combined_text,
+                    duration_seconds=duration,
+                )
+                
+                # Also update speaker name in Convex if we learned it
+                if speaker_id in self._speaker_names:
+                    await self._convex.update_speaker_name(
+                        speaker_id=convex_id,
+                        name=self._speaker_names[speaker_id],
+                    )
+
+    def get_speaker_display_name(self, speaker_id: str) -> str:
+        """Get display name for a speaker (real name if known, otherwise speaker_id)."""
+        return self._speaker_names.get(speaker_id, speaker_id)
 
     def _print_transcript(
         self, conversation_id: str, snippets: List[TranscriptSegment]
@@ -336,7 +706,9 @@ class AudioPipeline:
             minutes, seconds = divmod(segment.start, 60.0)
             millis = int(round((seconds - int(seconds)) * 100))
             timestamp = f"{int(minutes):02d}:{int(seconds)%60:02d}.{millis:02d}"
-            speaker_label = segment.speaker or "speaker_unknown"
+            # Use real name if known, otherwise fallback to speaker_id
+            speaker_id = segment.speaker or "speaker_unknown"
+            speaker_label = self.get_speaker_display_name(speaker_id)
             line = f"[{timestamp}] {speaker_label}: {segment.text}"
             print(f"\033[31m{line}\033[0m", flush=True)
 
@@ -401,16 +773,28 @@ class AudioPipeline:
             for segment in snippets
         ]
 
-        primary_speaker = next(
+        primary_speaker_id = next(
             (entry.speaker for entry in conversation if entry.speaker != "speaker_unknown"),
             state.last_speaker_id,
         ) or "speaker_unknown"
+
+        # Resolve to Convex ID if available
+        # This is CRITICAL: Frontend expects a valid Convex ID, not a Pyannote ID
+        convex_id = self._speaker_convex_ids.get(primary_speaker_id)
+        if convex_id:
+            person_id = convex_id
+        else:
+            # If no Convex ID, send name if known, else speaker ID
+            # But frontend might fail if it tries to query with this.
+            # Ideally we only send if we have a Convex ID or null.
+            # But the frontend hook handles "skip" if id is null.
+            person_id = primary_speaker_id
 
         event = ConversationEvent(
             event_type="CONVERSATION_END",
             conversation_id=state.conversation_id,
             session_id=session_id,
-            person_id=primary_speaker,
+            person_id=person_id,
             conversation=conversation,
         )
 
@@ -432,13 +816,21 @@ class AudioPipeline:
         async with self._whisper_lock:
             if self._whisper_model is not None:
                 return self._whisper_model
+            if not faster_whisper_available:
+                logger.warning("faster-whisper not installed; cannot load model")
+                return None
             try:
-                model = await asyncio.to_thread(
-                    whisper.load_model, self.config.transcription_model
-                )
+                # Use int8 quantization for best accuracy within 8GB VRAM
+                def _load():
+                    return WhisperModel(
+                        self.config.transcription_model,
+                        device="cuda",
+                        compute_type="int8_float16",  # Best balance of speed and accuracy
+                    )
+                model = await asyncio.to_thread(_load)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "Failed to load Whisper model '%s': %s",
+                    "Failed to load faster-whisper model '%s': %s",
                     self.config.transcription_model,
                     exc,
                 )
@@ -446,7 +838,7 @@ class AudioPipeline:
                 return None
             self._whisper_model = model
             logger.info(
-                "Loaded Whisper model '%s' for transcription",
+                "Loaded faster-whisper model '%s' for transcription (CUDA, int8_float16)",
                 self.config.transcription_model,
             )
             return self._whisper_model

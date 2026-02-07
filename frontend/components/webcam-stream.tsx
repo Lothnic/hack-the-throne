@@ -12,6 +12,7 @@ import {
   mapBoundingBoxToOverlay,
   calculateNotificationPosition,
 } from "@/lib/coordinate-mapper"
+import PersonContextCard from "./PersonContextCard"
 
 interface PersonData {
   name: string
@@ -31,12 +32,13 @@ export default function WebcamStream() {
   const [isVideoReady, setIsVideoReady] = useState(false)
   const [facePersonData, setFacePersonData] = useState<FacePersonMap>(new Map())
   const [latestPersonData, setLatestPersonData] = useState<PersonData | null>(null)
+  const [activeSpeaker, setActiveSpeaker] = useState<PersonData | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [eventSource, setEventSource] = useState<EventSource | null>(null)
   const [isRayBanMode, setIsRayBanMode] = useState(false)
   const [isMuted, setIsMuted] = useState(false)
 
-  const INFERENCE_BACKEND_URL = "http://localhost:8002"
+  const INFERENCE_BACKEND_URL = "http://localhost:8000"
   const OFFER_BACKEND_URL = "http://localhost:8000"
 
   const { detectedFaces, isLoading: isFaceDetectionLoading, error: faceDetectionError } = useFaceDetection(
@@ -109,12 +111,14 @@ export default function WebcamStream() {
           console.log('[SSE] Received inference event:', message)
 
           if (message.name && message.description && message.relationship) {
-            setLatestPersonData({
+            const personData = {
               name: message.name,
               description: message.description,
               relationship: message.relationship,
               person_id: message.person_id,
-            })
+            }
+            setLatestPersonData(personData) // For face mapping (consumed)
+            setActiveSpeaker(personData)    // For UI Card (persistent)
           }
         } catch (err) {
           console.error('[SSE] Error parsing message:', err)
@@ -262,7 +266,9 @@ export default function WebcamStream() {
     setIsVideoReady(false)
     setIsConnected(false)
     setIsRayBanMode(false)
+    setIsRayBanMode(false)
     setIsMuted(false)
+    setActiveSpeaker(null)
   }
 
   const toggleMute = useCallback(() => {
@@ -331,6 +337,15 @@ export default function WebcamStream() {
         )}
         style={{ transform: 'scaleX(-1)' }}
       />
+
+      {/* Real-time Person Context Card */}
+      {/* Real-time Person Context Card */}
+      {!isRayBanMode && (
+        <PersonContextCard
+          speakerId={activeSpeaker?.person_id || null}
+          speakerName={activeSpeaker?.name || null}
+        />
+      )}
 
       {!isRayBanMode && (
         <>

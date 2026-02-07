@@ -15,6 +15,10 @@ export const metadata: Metadata = {
   description: "AI-powered webcam streaming application"
 }
 
+import ConvexClientProvider from "@/components/ConvexClientProvider";
+
+// ... (imports remain the same, just adding the provider import if not already there, actually I'll insert it at the top level separately if needed, but here I replace the body)
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -23,7 +27,9 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className={`font-sans ${inter.variable} ${GeistMono.variable}`}>
-        <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
+        <ConvexClientProvider>
+          <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
+        </ConvexClientProvider>
       </body>
     </html>
   )
