@@ -74,21 +74,31 @@ def handle_person_detected(event: ConversationEvent) -> InferenceResult:
         )
         logger.info(f"Person detected: {person_doc['name']} ({event.person_id})")
     else:
-        person_label = event.person_id or "speaker_unknown"
-        friendly_name = person_label.replace("_", " ").title()
-        if person_label and person_label.startswith("speaker_"):
-            suffix = person_label[8:]
-            if suffix.isdigit():
-                friendly_name = f"Speaker {suffix}"
+        # Person not found in database - use speaker name from conversation if available
+        speaker_name = None
+        if event.conversation and len(event.conversation) > 0:
+            speaker_name = event.conversation[0].speaker
+            
+        # Use conversation speaker name if it's meaningful
+        if speaker_name and speaker_name not in ["Unknown", "Unknown Person", "New Person"]:
+            friendly_name = speaker_name
+        else:
+            # Fallback to formatting person_id
+            person_label = event.person_id or "speaker_unknown"
+            friendly_name = person_label.replace("_", " ").title()
+            if person_label and person_label.startswith("speaker_"):
+                suffix = person_label[8:]
+                if suffix.isdigit():
+                    friendly_name = f"Speaker {suffix}"
+                    
         description = latest_utterance or "No previous interactions"
-        # Person not found in database
         result = InferenceResult(
-            person_id=person_label,
+            person_id=event.person_id or "unknown",
             name=friendly_name,
             relationship="Unidentified speaker",
             description=description,
         )
-        logger.warning(f"Person not found in database: {event.person_id}")
+        logger.warning(f"Person not found in database: {event.person_id}, using name: {friendly_name}")
 
     return result
 

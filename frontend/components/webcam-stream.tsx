@@ -357,6 +357,22 @@ export default function WebcamStream() {
     }
   }, [isRecording])
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        e.preventDefault()
+        if (isRecording) {
+          stopRecording()
+        } else if (!isProcessing && isStreaming) {
+          startRecording()
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [isRecording, isProcessing, isStreaming, startRecording, stopRecording])
+
   const faceNotifications = detectedFaces.map((face) => {
     const video = videoRef.current
     const overlay = overlayRef.current

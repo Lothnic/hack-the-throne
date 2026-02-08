@@ -470,8 +470,13 @@ async def stream_inference() -> StreamingResponse:
                 except asyncio.CancelledError:
                     break
                 # Transform to match frontend expected format
+                # Use speaker name from conversation if available
+                display_name = "Unknown"
+                if event.conversation and len(event.conversation) > 0:
+                    display_name = event.conversation[0].speaker or "Unknown"
+
                 payload = {
-                    "name": event.person_id or "Unknown",
+                    "name": display_name,
                     "description": " ".join(u.text for u in event.conversation) if event.conversation else "",
                     "relationship": "Speaker",
                     "person_id": event.person_id,
