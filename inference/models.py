@@ -23,7 +23,7 @@ class ConversationUtterance(BaseModel):
 class ConversationEvent(BaseModel):
     """Event from speaker diarization metadata service - two types."""
 
-    event_type: Literal["PERSON_DETECTED", "CONVERSATION_END"] = Field(
+    event_type: Literal["PERSON_DETECTED", "CONVERSATION_END", "FACE_DETECTED"] = Field(
         ..., description="Type of event: PERSON_DETECTED or CONVERSATION_END"
     )
     person_id: str = Field(..., description="Person identifier from diarization")

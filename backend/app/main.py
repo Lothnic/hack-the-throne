@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .audio import AdaptiveDenoiser, AudioPipeline, PipelineConfig
-from .core import AudioChunk
+from .core import AudioChunk, ConversationEvent, ConversationUtterance
 from .services.conversation_stream import ConversationEventBus
 from .video.pipeline import VideoPipeline, get_video_pipeline
 from .services.convex_client import get_convex_service
@@ -186,12 +186,28 @@ If no name is mentioned, return "Unknown"."""},
                 logger.info("LLM extracted name: %s (%s)", extracted_name, relationship)
             except Exception as e:
                 logger.warning("LLM name extraction failed: %s", e)
-            
             # Save to Convex - look up existing speaker first
             speaker_id = None
             final_name = extracted_name
             
             try:
+                # Use shared LLM Service
+                from .services.llm_service import get_llm_service
+                llm_service = get_llm_service()
+                
+                logger.info("Processing transcript for LLM: '%s'", text)
+
+                # Extract details using LLM Service
+                updates = await llm_service.extract_relationship_info([ConversationUtterance(speaker="User", text=text)])
+                if updates:
+                    logger.info("LLM Raw Updates: %s", updates)
+                    if updates.get("name"):
+                        extracted_name = updates["name"]
+                    if updates.get("relationship"):
+                        relationship = updates["relationship"]
+                else:
+                    logger.info("LLM returned no updates.")
+                
                 # If name was extracted, try to find existing speaker with that name
                 if extracted_name and extracted_name not in ["Unknown", "New Person"]:
                     existing_speaker = await convex_service.get_speaker_by_name(extracted_name)
@@ -207,6 +223,17 @@ If no name is mentioned, return "Unknown"."""},
                             duration_seconds=10.0,
                             summary=summary,
                         )
+                        
+                        # Update relationship if found
+                        if relationship and relationship != "Someone you know":
+                            logger.info("Updating existing speaker relationship to: %s", relationship)
+                            await convex_service.update_speaker_profile(
+                                speaker_id=speaker_id,
+                                relationship=relationship
+                            )
+                        else:
+                            logger.info("Skipping relationship update (Current: %s)", relationship)
+
                     else:
                         # New person with name - create speaker using find_or_create
                         speaker_result = await convex_service.find_or_create_speaker(
@@ -222,11 +249,17 @@ If no name is mentioned, return "Unknown"."""},
                                 duration_seconds=10.0,
                                 summary=summary,
                             )
+                            # Update relationship
+                            if relationship and relationship != "Someone you know":
+                                logger.info("Setting new speaker relationship to: %s", relationship)
+                                await convex_service.update_speaker_profile(
+                                    speaker_id=speaker_id,
+                                    relationship=relationship
+                                )
                 else:
                     # No name extracted - try to find most recent speaker
                     logger.info("No name extracted (got '%s'), looking up recent speakers...", extracted_name)
                     recent_speakers = await convex_service.list_speakers()
-                    logger.info("list_speakers returned: %s", recent_speakers[:2] if recent_speakers else "empty")
                     
                     if recent_speakers and len(recent_speakers) > 0:
                         recent = recent_speakers[0]
@@ -241,6 +274,14 @@ If no name is mentioned, return "Unknown"."""},
                             duration_seconds=10.0,
                             summary=summary,
                         )
+                        
+                        # Update relationship if found (even if name wasn't mentioned)
+                        if relationship and relationship != "Someone you know":
+                            logger.info("Updating recent speaker relationship to: %s", relationship)
+                            await convex_service.update_speaker_profile(
+                                speaker_id=speaker_id,
+                                relationship=relationship
+                            )
                     else:
                         # No speakers exist - create anonymous one
                         logger.info("No speakers found, creating Unknown Person")
@@ -248,7 +289,6 @@ If no name is mentioned, return "Unknown"."""},
                             embedding=[0.0] * 512,
                             name="Unknown Person",
                         )
-                        logger.info("find_or_create_speaker result: %s", speaker_result)
                         if speaker_result:
                             speaker_id = speaker_result.get("speakerId")
                             final_name = "Unknown Person"
@@ -258,6 +298,14 @@ If no name is mentioned, return "Unknown"."""},
                                 duration_seconds=10.0,
                                 summary=summary,
                             )
+                            if relationship and relationship != "Someone you know":
+                                logger.info("Setting anonymous speaker relationship to: %s", relationship)
+                                await convex_service.update_speaker_profile(
+                                    speaker_id=speaker_id,
+                                    relationship=relationship
+                                )
+
+
             except Exception as e:
                 logger.warning("Convex speaker operations failed: %s", e)
             
@@ -300,7 +348,7 @@ If no name is mentioned, return "Unknown"."""},
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Transcription error: %s", exc)
+        logger.error("Transcription failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -373,6 +421,7 @@ async def offer(session: SDPModel) -> SDPModel:
                 import time
                 frame_count = 0
                 last_face_id = None
+                last_publish_ts = 0
                 
                 while True:
                     try:
@@ -403,13 +452,35 @@ async def offer(session: SDPModel) -> SDPModel:
                                 
                                 if result and result.get("found"):
                                     speaker_id = result.get("speakerId")
-                                    if speaker_id != last_face_id:
+                                    name = result.get("speaker", {}).get("name", "Unknown")
+                                    
+                                    # Publish event if person changed OR it's been > 4s
+                                    now = time.time()
+                                    if speaker_id != last_face_id or (now - last_publish_ts > 4.0):
                                         logger.info(
                                             "Face recognized: %s (score=%.2f)",
-                                            result.get("speaker", {}).get("name", "Unknown"),
+                                            name,
                                             result.get("score", 0)
                                         )
                                         last_face_id = speaker_id
+                                        last_publish_ts = now
+                                        
+                                        # Publish FACE_DETECTED event
+                                        try:
+                                            # Using "CONVERSATION_END" type for now as frontend/stream logic expects it
+                                            # But really we should add handling for "FACE_DETECTED"
+                                            # For now, let's reuse the existing flow which triggers stream update
+                                            event = ConversationEvent(
+                                                event_type="FACE_DETECTED",
+                                                person_id=speaker_id,
+                                                conversation_id=uuid4().hex,
+                                                session_id=session_id,
+                                                conversation=[ConversationUtterance(speaker=name, text="")]
+                                            )
+                                            await conversation_bus.publish(event)
+                                        except Exception as e:
+                                            logger.warning("Failed to publish face event: %s", e)
+
                                 else:
                                     # Unknown face - check if we can associate with active audio speaker
                                     global latest_speaker_info
@@ -429,8 +500,20 @@ async def offer(session: SDPModel) -> SDPModel:
                                         if success:
                                             logger.info("✓ Learned face for %s!", active_name)
                                             last_face_id = active_id
+                                            # Publish immediately upon learning
+                                            try:
+                                                event = ConversationEvent(
+                                                    event_type="FACE_DETECTED",
+                                                    person_id=active_id,
+                                                    conversation_id=uuid4().hex,
+                                                    session_id=session_id,
+                                                    conversation=[ConversationUtterance(speaker=active_name, text="")]
+                                                )
+                                                await conversation_bus.publish(event)
+                                            except:
+                                                pass
                                     else:
-                                        logger.debug("Unknown face detected")
+                                        # logger.debug("Unknown face detected")
                                         last_face_id = None
                         except Exception as exc:
                             logger.debug("Video frame processing error: %s", exc)
@@ -463,6 +546,14 @@ async def offer(session: SDPModel) -> SDPModel:
 
     logger.info("Returning answer for PeerConnection %s", id(pc))
     return SDPModel(sdp=pc.localDescription.sdp, type=pc.localDescription.type)
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Start background tasks on application startup."""
+    # Audio processing is handled on-demand via /transcribe endpoint
+    # Real-time processing is currently disabled
+    pass
 
 
 @app.on_event("shutdown")
@@ -507,15 +598,48 @@ async def stream_inference() -> StreamingResponse:
                 except asyncio.CancelledError:
                     break
                 # Transform to match frontend expected format
+                # Transform to match frontend expected format
                 # Use speaker name from conversation if available
                 display_name = "Unknown"
                 if event.conversation and len(event.conversation) > 0:
                     display_name = event.conversation[0].speaker or "Unknown"
 
+                # Fetch enhanced context from Convex
+                description = " ".join(u.text for u in event.conversation) if event.conversation else ""
+                relationship = "Guest"
+                
+                # Check if person_id is a valid Convex ID (20-30 chars usually, not "speaker_record_...")
+                if event.person_id and not event.person_id.startswith("speaker_record_"):
+                    try:
+                        ctx = await convex_service.get_person_context(event.person_id)
+                        if ctx:
+                            # Use stored relationship if available
+                            if ctx.get("relationship"):
+                                relationship = ctx.get("relationship")
+                            
+                            # Construct rich description
+                            parts = []
+                            if ctx.get("lastSeenText"):
+                                parts.append(f"Last visited: {ctx['lastSeenText']}.")
+                            
+                            # Add conversation starter
+                            if ctx.get("recentConversations") and len(ctx["recentConversations"]) > 0:
+                                last_topic = ctx["recentConversations"][0].get("summary")
+                                if last_topic:
+                                    parts.append(f"Ask about: {last_topic}")
+                            else:
+                                parts.append("Ask about their day.")
+                                
+                            if parts:
+                                description = " ".join(parts)
+                                
+                    except Exception as e:
+                        logger.warning("Error fetching person context: %s", e)
+
                 payload = {
                     "name": display_name,
-                    "description": " ".join(u.text for u in event.conversation) if event.conversation else "",
-                    "relationship": "Speaker",
+                    "description": description,
+                    "relationship": relationship,
                     "person_id": event.person_id,
                 }
                 import json

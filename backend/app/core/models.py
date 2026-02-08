@@ -56,7 +56,7 @@ class ConversationUtterance(BaseModel):
 class ConversationEvent(BaseModel):
     """Event emitted by the audio pipeline for downstream consumers."""
 
-    event_type: Literal["PERSON_DETECTED", "CONVERSATION_END"]
+    event_type: Literal["PERSON_DETECTED", "CONVERSATION_END", "FACE_DETECTED"]
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     person_id: Optional[str] = None
     conversation_id: Optional[str] = None

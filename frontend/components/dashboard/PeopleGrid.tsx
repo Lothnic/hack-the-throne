@@ -1,62 +1,47 @@
-
 "use client";
 
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { Badge } from "@/components/ui/badge";
-import { Users, User } from "lucide-react";
+import { Users } from "lucide-react";
 
 export function PeopleGrid() {
     const speakers = useQuery(api.speakers.listSpeakers, {});
 
     if (!speakers) {
-        return <div className="p-4">Loading people...</div>;
+        return <div className="p-4 text-slate-400">Loading...</div>;
     }
 
-    const knownPeople = speakers.filter(s => s.name && s.name !== "Unknown" && s.name !== "Unknown Person");
+    const knownPeople = speakers.filter((s: { name?: string }) => s.name && s.name !== "Unknown" && s.name !== "Unknown Person");
 
     return (
-        <Card>
-            <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                    <Users className="w-5 h-5" />
-                    People Directory
+        <Card className="border-0 shadow-sm bg-white/80 backdrop-blur-sm">
+            <CardHeader className="pb-4">
+                <CardTitle className="flex items-center gap-2 text-xl text-slate-700">
+                    <Users className="w-5 h-5 text-emerald-500" />
+                    Your People
                 </CardTitle>
             </CardHeader>
             <CardContent>
                 {knownPeople.length === 0 ? (
-                    <div className="text-center py-8 text-muted-foreground">
-                        <User className="w-10 h-10 mx-auto mb-2 opacity-50" />
-                        <p>No known people yet.</p>
-                    </div>
+                    <p className="text-center py-8 text-slate-400">No people recorded yet</p>
                 ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {knownPeople.map((person) => (
-                            <div key={person._id} className="flex items-center space-x-4 rounded-lg border p-4 hover:bg-muted/50 transition-colors">
-                                <Avatar className="h-12 w-12 border-2 border-primary/20">
+                    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                        {knownPeople.map((person: { _id: string; name?: string; photoUrl?: string; relationship?: string }) => (
+                            <div key={person._id} className="flex flex-col items-center p-4 rounded-2xl bg-gradient-to-b from-slate-50 to-white border border-slate-100 hover:border-emerald-200 transition-colors">
+                                <Avatar className="h-20 w-20 mb-3 ring-4 ring-white shadow-md">
                                     <AvatarImage src={person.photoUrl} />
-                                    <AvatarFallback className="text-lg bg-primary/10 text-primary">
+                                    <AvatarFallback className="text-2xl bg-emerald-100 text-emerald-600">
                                         {person.name?.[0]}
                                     </AvatarFallback>
                                 </Avatar>
-                                <div className="flex-1 space-y-1">
-                                    <div className="flex items-center justify-between">
-                                        <p className="text-sm font-medium leading-none">{person.name}</p>
-                                        {person.relationship && (
-                                            <Badge variant="secondary" className="text-xs">
-                                                {person.relationship}
-                                            </Badge>
-                                        )}
-                                    </div>
-                                    <p className="text-xs text-muted-foreground line-clamp-1">
-                                        {person.description || "No description available"}
-                                    </p>
-                                    <p className="text-xs text-muted-foreground">
-                                        Seen {person.seenCount} times
-                                    </p>
-                                </div>
+                                <h3 className="text-lg font-semibold text-slate-800">{person.name}</h3>
+                                {person.relationship && (
+                                    <span className="text-sm text-emerald-600 font-medium mt-1">
+                                        {person.relationship}
+                                    </span>
+                                )}
                             </div>
                         ))}
                     </div>
