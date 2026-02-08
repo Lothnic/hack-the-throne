@@ -72,17 +72,17 @@ Other names: Priya, Rahul, Aarav, Ananya, Vikram, Neha, Arjun."""
 @dataclass
 class PipelineConfig:
     target_sample_rate: int = 16_000
-    silence_timeout_seconds: float = 0.8  # Reduced for faster response & shorter chunks
-    min_conversation_seconds: float = 1.0  # Reduced to capture shorter phrases
-    vad_aggressiveness: int = 1
-    transcription_model: str = "large-v3"  # Best accuracy with faster-whisper
-    min_speech_rms: float = 0.005
+    silence_timeout_seconds: float = 1.0
+    min_conversation_seconds: float = 2.0  # Increased to ignore short noises
+    vad_aggressiveness: int = 2  # More aggressive VAD
+    transcription_model: str = "large-v3"
+    min_speech_rms: float = 0.05  # Increased 10x to ignore background noise
     noise_floor_smoothing: float = 0.9
-    noise_gate_margin: float = 0.005
+    noise_gate_margin: float = 0.015
     embedding_model: str = "pyannote/embedding"
     speaker_match_threshold: float = 0.25
-    embedding_window_seconds: float = 0.8
-    disable_realtime_publish: bool = True  # Only Record button sends to speaker card
+    embedding_window_seconds: float = 1.0
+    disable_realtime_publish: bool = True  # Keep strictly for manual recording flow
 
 
 @dataclass

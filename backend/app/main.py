@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Set
@@ -339,15 +340,18 @@ async def offer(session: SDPModel) -> SDPModel:
                             sample_rate=sample_rate,
                             timestamp=datetime.utcnow(),
                         )
-                        try:
-                            await audio_pipeline.process_chunk(chunk)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.exception(
-                                "Audio pipeline error for session %s: %s",
-                                session_id,
-                                exc,
-                            )
-                            continue
+                        # User requested to disable "always on" detection.
+                        # We skip processing the chunk here.
+                        # Manual recording (Spacebar) uses /transcribe endpoint instead.
+                        # try:
+                        #     await audio_pipeline.process_chunk(chunk)
+                        # except Exception as exc:  # noqa: BLE001
+                        #     logger.exception(
+                        #         "Audio pipeline error for session %s: %s",
+                        #         session_id,
+                        #         exc,
+                        #     )
+                        #     continue
                     except Exception:  # noqa: BLE001
                         break
 

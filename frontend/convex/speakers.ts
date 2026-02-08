@@ -237,7 +237,7 @@ export const findSpeakerByFace = action({
         faceEmbedding: v.array(v.float64()),
         threshold: v.optional(v.float64()),
     },
-    handler: async (ctx, { faceEmbedding, threshold = 0.6 }) => {
+    handler: async (ctx, { faceEmbedding, threshold = 0.4 }) => {
         // Vector search on face embeddings
         const results = await ctx.vectorSearch("speakers", "by_face_embedding", {
             vector: faceEmbedding,

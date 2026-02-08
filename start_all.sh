@@ -19,6 +19,13 @@ cd inference
 INFERENCE_PID=$!
 cd ..
 
+# Start Convex Dev (syncs functions)
+echo "Starting Convex Dev..."
+cd frontend
+npx convex dev &> ../convex.log &
+CONVEX_PID=$!
+cd ..
+
 # Start Frontend (Port 3000)
 echo "Starting Frontend on PORT 3000..."
 cd frontend
@@ -29,8 +36,9 @@ cd ..
 echo "All services started!"
 echo "Backend PID: $BACKEND_PID"
 echo "Inference PID: $INFERENCE_PID"
+echo "Convex PID: $CONVEX_PID"
 echo "Frontend PID: $FRONTEND_PID"
 
 # Wait for user input to kill everything on exit
 read -p "Press Enter to stop all services..."
-kill $BACKEND_PID $INFERENCE_PID $FRONTEND_PID
+kill $BACKEND_PID $INFERENCE_PID $CONVEX_PID $FRONTEND_PID
