@@ -5,6 +5,9 @@ import { Button } from "@/components/ui/button"
 import { Mic, MicOff, Video, VideoOff, Circle, Square, Loader2 } from "lucide-react"
 import { FaceNotification } from "@/components/face-notification"
 import { useFaceDetection } from "@/hooks/use-face-detection"
+import { useWebRTC } from "@/hooks/use-webrtc"
+import { useRecording } from "@/hooks/use-recording"
+import { useInferenceSSE } from "@/hooks/use-inference-sse"
 import { cn } from "@/lib/utils"
 import {
   calculateVideoTransform,
@@ -25,24 +28,15 @@ type FacePersonMap = Map<string, PersonData>
 export default function WebcamStream() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const overlayRef = useRef<HTMLDivElement>(null)
-  const pcRef = useRef<RTCPeerConnection | null>(null)
   const streamRef = useRef<MediaStream | null>(null)
   const [isStreaming, setIsStreaming] = useState(false)
   const [isVideoReady, setIsVideoReady] = useState(false)
   const [facePersonData, setFacePersonData] = useState<FacePersonMap>(new Map())
-  const [latestPersonData, setLatestPersonData] = useState<PersonData | null>(null)
-  const [activeSpeaker, setActiveSpeaker] = useState<PersonData | null>(null)
-  const [isConnected, setIsConnected] = useState(false)
-  const [eventSource, setEventSource] = useState<EventSource | null>(null)
   const [isMuted, setIsMuted] = useState(false)
-  const [isRecording, setIsRecording] = useState(false)
-  const [isProcessing, setIsProcessing] = useState(false)
-  const [transcription, setTranscription] = useState<string | null>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<Blob[]>([])
 
-  const INFERENCE_BACKEND_URL = "http://localhost:8000"
-  const OFFER_BACKEND_URL = "http://localhost:8000"
+  const { isConnected, setupWebRTC, closeConnection } = useWebRTC()
+  const { isRecording, isProcessing, transcription, setTranscription, startRecording, stopRecording } = useRecording(streamRef)
+  const { latestPersonData, activeSpeaker, setActiveSpeaker, setLatestPersonData, connectSSE, disconnectSSE } = useInferenceSSE()
 
   const { detectedFaces, isLoading: isFaceDetectionLoading, error: faceDetectionError } = useFaceDetection(
     videoRef.current,
@@ -73,10 +67,10 @@ export default function WebcamStream() {
 
     console.log(`[FaceDetection] Associated "${latestPersonData.name}" with face ${mostProminentFace.id}`)
     setLatestPersonData(null)
-  }, [latestPersonData, detectedFaces])
+  }, [latestPersonData, detectedFaces, setLatestPersonData])
 
   useEffect(() => {
-    const currentFaceIds = new Set(detectedFaces.map(f => f.id))
+    const currentFaceIds = new Set(detectedFaces.map((f) => f.id))
     setFacePersonData((prev) => {
       const newMap = new Map(prev)
       for (const faceId of newMap.keys()) {
@@ -96,123 +90,11 @@ export default function WebcamStream() {
       stopWebcam()
       disconnectSSE()
     }
-  }, [])
-
-  const connectSSE = () => {
-    try {
-      const es = new EventSource(`${INFERENCE_BACKEND_URL}/stream/inference`)
-
-      console.log('[SSE] Connecting to:', `${INFERENCE_BACKEND_URL}/stream/inference`)
-
-      es.onopen = () => {
-        console.log('[SSE] Connected')
-      }
-
-      es.addEventListener('inference', (event) => {
-        try {
-          const message = JSON.parse(event.data)
-          console.log('[SSE] Received inference event:', message)
-
-          if (message.name && message.description && message.relationship) {
-            const personData = {
-              name: message.name,
-              description: message.description,
-              relationship: message.relationship,
-              person_id: message.person_id,
-            }
-            setLatestPersonData(personData) // For face mapping (consumed)
-            setActiveSpeaker(personData)    // For UI Card (persistent)
-          }
-        } catch (err) {
-          console.error('[SSE] Error parsing message:', err)
-        }
-      })
-
-      es.onerror = (error) => {
-        console.error('[SSE] Error:', error)
-      }
-
-      setEventSource(es)
-    } catch (err) {
-      console.error('[SSE] Connection error:', err)
-    }
-  }
-
-  const disconnectSSE = () => {
-    if (eventSource) {
-      eventSource.close()
-      setEventSource(null)
-    }
-  }
-
-  const waitForIceGathering = (pc: RTCPeerConnection): Promise<void> => {
-    return new Promise((resolve) => {
-      if (pc.iceGatheringState === 'complete') {
-        resolve()
-        return
-      }
-
-      const checkState = () => {
-        if (pc.iceGatheringState === 'complete') {
-          pc.removeEventListener('icegatheringstatechange', checkState)
-          resolve()
-        }
-      }
-
-      pc.addEventListener('icegatheringstatechange', checkState)
-    })
-  }
-
-  const setupWebRTC = async (stream: MediaStream) => {
-    try {
-      console.log('[WebRTC] Setting up peer connection')
-      const pc = new RTCPeerConnection()
-      pcRef.current = pc
-
-      stream.getTracks().forEach(track => {
-        console.log('[WebRTC] Adding track:', track.kind)
-        pc.addTrack(track, stream)
-      })
-
-      pc.onconnectionstatechange = () => {
-        console.log('[WebRTC] Connection state:', pc.connectionState)
-        setIsConnected(pc.connectionState === 'connected')
-      }
-
-      const offer = await pc.createOffer()
-      await pc.setLocalDescription(offer)
-      console.log('[WebRTC] Created offer, waiting for ICE gathering...')
-
-      await waitForIceGathering(pc)
-      console.log('[WebRTC] ICE gathering complete, sending offer to backend')
-
-      const response = await fetch(`${OFFER_BACKEND_URL}/offer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sdp: pc.localDescription!.sdp,
-          type: pc.localDescription!.type
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error(`Backend responded with ${response.status}`)
-      }
-
-      const answer = await response.json()
-      console.log('[WebRTC] Received answer from backend')
-      await pc.setRemoteDescription(answer)
-      console.log('[WebRTC] Connection established!')
-
-    } catch (err) {
-      console.error('[WebRTC] Setup error:', err)
-      setIsConnected(false)
-    }
-  }
+  }, [connectSSE, disconnectSSE])
 
   const startWebcam = async () => {
     try {
-      console.log('[Webcam] Requesting media access...')
+      console.log("[Webcam] Requesting media access...")
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 1280, height: 720 },
         audio: true,
@@ -222,14 +104,14 @@ export default function WebcamStream() {
         const video = videoRef.current
 
         const handleMetadataLoaded = () => {
-          console.log('[Webcam] Video metadata loaded:', {
+          console.log("[Webcam] Video metadata loaded:", {
             width: video.videoWidth,
-            height: video.videoHeight
+            height: video.videoHeight,
           })
           setIsVideoReady(true)
         }
 
-        video.addEventListener('loadedmetadata', handleMetadataLoaded)
+        video.addEventListener("loadedmetadata", handleMetadataLoaded)
 
         if (video.videoWidth > 0 && video.videoHeight > 0) {
           handleMetadataLoaded()
@@ -241,7 +123,7 @@ export default function WebcamStream() {
           track.enabled = !isMuted
         })
         setIsStreaming(true)
-        console.log('[Webcam] Stream started')
+        console.log("[Webcam] Stream started")
 
         setTimeout(() => setupWebRTC(stream), 1000)
       }
@@ -251,7 +133,7 @@ export default function WebcamStream() {
   }
 
   const stopWebcam = () => {
-    console.log('[Webcam] Stopping stream')
+    console.log("[Webcam] Stopping stream")
 
     if (videoRef.current?.srcObject) {
       const stream = videoRef.current.srcObject as MediaStream
@@ -259,15 +141,11 @@ export default function WebcamStream() {
       videoRef.current.srcObject = null
     }
 
-    if (pcRef.current) {
-      pcRef.current.close()
-      pcRef.current = null
-    }
+    closeConnection()
 
     streamRef.current = null
     setIsStreaming(false)
     setIsVideoReady(false)
-    setIsConnected(false)
     setIsMuted(false)
     setActiveSpeaker(null)
   }
@@ -286,80 +164,9 @@ export default function WebcamStream() {
     })
   }, [])
 
-  const startRecording = useCallback(() => {
-    const stream = streamRef.current
-    if (!stream) return
-
-    audioChunksRef.current = []
-    const audioStream = new MediaStream(stream.getAudioTracks())
-    const mediaRecorder = new MediaRecorder(audioStream, { mimeType: 'audio/webm' })
-
-    mediaRecorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        audioChunksRef.current.push(event.data)
-      }
-    }
-
-    mediaRecorder.onstop = async () => {
-      setIsProcessing(true)
-      const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-
-      try {
-        const formData = new FormData()
-        formData.append('audio', audioBlob, 'recording.webm')
-
-        const response = await fetch(`${INFERENCE_BACKEND_URL}/transcribe`, {
-          method: 'POST',
-          body: formData,
-        })
-
-        if (response.ok) {
-          const result = await response.json()
-          const displayName = result.name || 'Unknown'
-          const displayText = result.text || 'No speech detected'
-
-          setTranscription(`${displayName}: ${displayText}`)
-          console.log('[Recording] Extracted name:', result.name, '| Relationship:', result.relationship)
-
-          // Update speaker card with extracted info
-          if (result.name && result.name !== 'Unknown') {
-            setActiveSpeaker({
-              name: result.name,
-              description: displayText,
-              relationship: result.relationship || 'Visitor',
-              person_id: result.speaker_id,
-            })
-          }
-        } else {
-          setTranscription('Transcription failed')
-        }
-      } catch (err) {
-        console.error('[Recording] Upload error:', err)
-        setTranscription('Error processing audio')
-      } finally {
-        setIsProcessing(false)
-      }
-    }
-
-    mediaRecorder.start()
-    mediaRecorderRef.current = mediaRecorder
-    setIsRecording(true)
-    setTranscription(null)
-    console.log('[Recording] Started')
-  }, [])
-
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop()
-      mediaRecorderRef.current = null
-      setIsRecording(false)
-      console.log('[Recording] Stopped')
-    }
-  }, [isRecording])
-
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.code === 'Space') {
+      if (e.code === "Space") {
         e.preventDefault()
         if (isRecording) {
           stopRecording()
@@ -369,48 +176,36 @@ export default function WebcamStream() {
       }
     }
 
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
   }, [isRecording, isProcessing, isStreaming, startRecording, stopRecording])
 
-  const faceNotifications = detectedFaces.map((face) => {
-    const video = videoRef.current
-    const overlay = overlayRef.current
+  const faceNotifications = detectedFaces
+    .map((face) => {
+      const video = videoRef.current
+      const overlay = overlayRef.current
 
-    if (!video || !overlay) return null
+      if (!video || !overlay) return null
 
-    const videoWidth = video.videoWidth
-    const videoHeight = video.videoHeight
-    const overlayWidth = overlay.clientWidth
-    const overlayHeight = overlay.clientHeight
+      const videoWidth = video.videoWidth
+      const videoHeight = video.videoHeight
+      const overlayWidth = overlay.clientWidth
+      const overlayHeight = overlay.clientHeight
 
-    if (videoWidth === 0 || videoHeight === 0) return null
+      if (videoWidth === 0 || videoHeight === 0) return null
 
-    const transform = calculateVideoTransform(
-      videoWidth,
-      videoHeight,
-      overlayWidth,
-      overlayHeight
-    )
+      const transform = calculateVideoTransform(videoWidth, videoHeight, overlayWidth, overlayHeight)
 
-    const overlayBox = mapBoundingBoxToOverlay(
-      face.boundingBox,
-      transform,
-      overlayWidth,
-      true
-    )
+      const overlayBox = mapBoundingBoxToOverlay(face.boundingBox, transform, overlayWidth, true)
 
-    const position = calculateNotificationPosition(
-      overlayBox,
-      overlayWidth,
-      overlayHeight
-    )
+      const position = calculateNotificationPosition(overlayBox, overlayWidth, overlayHeight)
 
-    return {
-      face,
-      position,
-    }
-  }).filter((n) => n !== null)
+      return {
+        face,
+        position,
+      }
+    })
+    .filter((n) => n !== null)
 
   return (
     <div className="relative h-screen w-screen overflow-hidden bg-black">
@@ -419,14 +214,10 @@ export default function WebcamStream() {
         autoPlay
         playsInline
         muted
-        className={cn(
-          "absolute inset-0 h-full w-full object-cover transition-all duration-300",
-          "scale-100"
-        )}
-        style={{ transform: 'scaleX(-1)' }}
+        className={cn("absolute inset-0 h-full w-full object-cover transition-all duration-300", "scale-100")}
+        style={{ transform: "scaleX(-1)" }}
       />
 
-      {/* Real-time Person Context Card */}
       <PersonContextCard
         speakerId={activeSpeaker?.person_id || null}
         speakerName={activeSpeaker?.name || null}
@@ -451,8 +242,10 @@ export default function WebcamStream() {
       </div>
 
       <div className="absolute top-4 right-4 flex items-center gap-2 px-3 py-2 bg-black/60 backdrop-blur-sm rounded-full">
-        <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} ${isConnected ? 'animate-pulse' : ''}`} />
-        <span className="text-xs text-white/80">{isConnected ? 'Connected (WebRTC)' : 'Disconnected'}</span>
+        <div
+          className={`w-2 h-2 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"} ${isConnected ? "animate-pulse" : ""}`}
+        />
+        <span className="text-xs text-white/80">{isConnected ? "Connected (WebRTC)" : "Disconnected"}</span>
       </div>
 
       {isFaceDetectionLoading && (
@@ -467,7 +260,6 @@ export default function WebcamStream() {
       )}
 
       <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center px-6 py-4 bg-gradient-to-t from-black/80 to-transparent">
-        {/* Transcription display */}
         {(transcription || isProcessing) && (
           <div className="mb-4 px-4 py-3 bg-black/70 backdrop-blur-sm rounded-lg max-w-lg w-full">
             {isProcessing ? (
@@ -482,7 +274,6 @@ export default function WebcamStream() {
         )}
 
         <div className="flex flex-wrap items-center gap-3">
-          {/* Record Button */}
           <Button
             size="icon"
             variant={isRecording ? "destructive" : "default"}
@@ -493,11 +284,7 @@ export default function WebcamStream() {
             )}
             disabled={!isStreaming || isProcessing}
           >
-            {isRecording ? (
-              <Square className="h-5 w-5 fill-current" />
-            ) : (
-              <Circle className="h-6 w-6 fill-red-500 text-red-500" />
-            )}
+            {isRecording ? <Square className="h-5 w-5 fill-current" /> : <Circle className="h-6 w-6 fill-red-500 text-red-500" />}
           </Button>
           <span className="text-sm text-white/80 min-w-[80px]">
             {isRecording ? "Stop" : isProcessing ? "Processing..." : "Record"}
